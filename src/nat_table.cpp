@@ -13,7 +13,6 @@ bool NatTable::Lookup(NatKey key, NatEntry& out) {
     auto it = table_.find(key);
     if (it == table_.end()) return false;
     out = it->second;
-    // Обновляем время последней активности (нужен exclusive lock)
     lock.unlock();
     std::unique_lock<std::shared_mutex> wlock(mutex_);
     auto it2 = table_.find(key);
@@ -42,5 +41,5 @@ void NatTable::Expire(int timeout_sec) {
         }
     }
     if (expired > 0)
-        std::cout << "[nat] Удалено устаревших UDP-сессий: " << expired << "\n";
+        std::cout << "[nat] Removed deprecated UDP-sessions: " << expired << "\n";
 }
