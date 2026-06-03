@@ -1,0 +1,54 @@
+# ==============================================================================
+# WFP Divert - Git Ignore Configurations
+# ==============================================================================
+
+# --- CMake Build and Binary Directories ---
+build/
+.cache/
+out/
+bin/
+
+# --- Globally Ignore Compiled Binaries & Object Files ---
+*.exe
+*.dll
+*.lib
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.o
+*.a
+
+# --- CRITICAL: Force Git to KEEP WinDivert precompiled dependencies ---
+# Standard git rules ignore .dll and .sys globally, so we must explicitly unignore them here:
+!windivert/x64/WinDivert.dll
+!windivert/x64/WinDivert.lib
+!windivert/x64/WinDivert64.sys
+!windivert/x86/WinDivert.dll
+!windivert/x86/WinDivert.lib
+!windivert/x86/WinDivert32.sys
+
+# --- Local User Configurations ---
+# Ignore your private config.json to keep your proxy settings off GitHub.
+# We commit config.example.json instead.
+config.json
+
+# --- IDE and Code Editors ---
+# Microsoft Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.aps
+*.local
+
+# JetBrains CLion / Rider
+.idea/
+cmake-build-*/
+
+# Visual Studio Code
+.vscode/
+
+# Temporary and Log files
+*.log
+*.tmp
