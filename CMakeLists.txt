@@ -34,14 +34,18 @@ target_link_libraries(wfp_divert PRIVATE
         ws2_32
         iphlpapi
         psapi
+        shell32
 )
 
-# Robust single-file copy operations for all CMake versions
+# Robust post-build file copy operations including config.example.json
 add_custom_command(TARGET wfp_divert POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${WINDIVERT_DIR}/${WINDIVERT_ARCH}/WinDivert.dll"
         $<TARGET_FILE_DIR:wfp_divert>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${WINDIVERT_DIR}/${WINDIVERT_ARCH}/${WINDIVERT_SYS}"
+        $<TARGET_FILE_DIR:wfp_divert>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/config.example.json"
         $<TARGET_FILE_DIR:wfp_divert>
 )

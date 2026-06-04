@@ -1,0 +1,11 @@
+{
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 10808,
+  "intercept_tcp": false,
+  "intercept_udp": true,
+  "udp_session_timeout_sec": 60,
+  "blacklist": [
+    "discord.exe",
+    "telegram.exe"
+  ]
+}

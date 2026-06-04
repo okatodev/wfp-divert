@@ -198,6 +198,7 @@ static void UdpRelayRecvThread(
 }
 
 void RunDivertEngine(const Config& cfg) {
+    g_running = true;
     std::string proxy_ip = cfg.proxy_host;
     std::string proto_filter;
 
