@@ -2,6 +2,7 @@
 #include "process_info.h"
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <unordered_map>
 #include <shared_mutex>
@@ -28,6 +29,23 @@ static std::string BaseName(const std::string& path) {
 }
 
 static bool QueryProcess(uint32_t pid, std::string& out_path, std::string& out_name) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(PROCESSENTRY32);
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) {
+                    out_name = ToLower(pe.szExeFile);
+                    out_path = out_name;
+                    CloseHandle(hSnapshot);
+                    return true;
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return false;
 

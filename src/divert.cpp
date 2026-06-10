@@ -3,6 +3,9 @@
 #include "process_info.h"
 #include "socks5_udp.h"
 #include "socks5_tcp.h"
+#include "nat_table.h"
+#include "../extra/denuvo/denuvo_bypass.h"
+#include "../extra/embark/embark_bypass.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -22,11 +25,13 @@
 
 static std::atomic<bool> g_running{ true };
 static HANDLE            g_divert_handle = INVALID_HANDLE_VALUE;
+static NatTable          g_tcp_nat;
 
 void StopDivertEngine() {
     g_running = false;
-    if (g_divert_handle != INVALID_HANDLE_VALUE)
+    if (g_divert_handle != INVALID_HANDLE_VALUE) {
         WinDivertClose(g_divert_handle);
+    }
 }
 
 static std::string ToLower(std::string s) {
@@ -39,7 +44,8 @@ static bool IsBlacklisted(const std::string& exe_name, const Config& cfg) {
 }
 
 static std::string FmtIP(uint32_t ip_net) {
-    in_addr a; a.s_addr = ip_net;
+    in_addr a;
+    a.s_addr = ip_net;
     return inet_ntoa(a);
 }
 
@@ -48,28 +54,29 @@ static uint32_t GetPidByUdpEndpoint(uint32_t src_ip, uint16_t src_port) {
     GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
     std::vector<uint8_t> buf(size);
 
-    if (GetExtendedUdpTable(buf.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != NO_ERROR)
+    if (GetExtendedUdpTable(buf.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
         return 0;
+    }
 
     auto* table = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buf.data());
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
         const auto& row = table->table[i];
-        /* CRITICAL: Compare ports in host-byte order to account for client 0.0.0.0 local bindings */
         if ((row.dwLocalAddr == src_ip || row.dwLocalAddr == 0) &&
-            ntohs((uint16_t)row.dwLocalPort) == ntohs(src_port))
+            ntohs((uint16_t)row.dwLocalPort) == ntohs(src_port)) {
             return row.dwOwningPid;
+        }
     }
     return 0;
 }
 
-static uint32_t GetPidByTcpEndpoint(uint32_t src_ip, uint16_t src_port,
-                                     uint32_t dst_ip, uint16_t dst_port) {
+static uint32_t GetPidByTcpEndpoint(uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port) {
     DWORD size = 0;
     GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
     std::vector<uint8_t> buf(size);
 
-    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
         return 0;
+    }
 
     auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
@@ -77,8 +84,9 @@ static uint32_t GetPidByTcpEndpoint(uint32_t src_ip, uint16_t src_port,
         if ((row.dwLocalAddr == src_ip || row.dwLocalAddr == 0) &&
             ntohs((uint16_t)row.dwLocalPort)  == ntohs(src_port) &&
             row.dwRemoteAddr == dst_ip  &&
-            ntohs((uint16_t)row.dwRemotePort) == ntohs(dst_port))
+            ntohs((uint16_t)row.dwRemotePort) == ntohs(dst_port)) {
             return row.dwOwningPid;
+        }
     }
     return 0;
 }
@@ -115,6 +123,7 @@ struct UdpSessionKey {
         return src_ip == o.src_ip && src_port == o.src_port;
     }
 };
+
 struct UdpSessionKeyHash {
     size_t operator()(const UdpSessionKey& k) const {
         return std::hash<uint64_t>()((uint64_t)k.src_ip << 16 | k.src_port);
@@ -156,7 +165,6 @@ static void UdpRelayRecvThread(
         int n = Socks5UdpRecv(*socks_sess, orig_src_ip, orig_src_port, payload, sizeof(payload));
         if (n <= 0) {
             int err = WSAGetLastError();
-            /* CRITICAL: Break if socket gets closed/reset to prevent high CPU spin cycles */
             if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
                 continue;
             }
@@ -187,7 +195,6 @@ static void UdpRelayRecvThread(
         WINDIVERT_ADDRESS addr{};
         addr.Outbound = FALSE;
         addr.Loopback = FALSE;
-        /* CRITICAL: Assign physical adapter interface index so Windows WFP accepts the faked inbound frame */
         addr.Network.IfIdx = if_idx;
         addr.Network.SubIfIdx = sub_if_idx;
         WinDivertHelperCalcChecksums(pkt.data(), (UINT)pkt_size, &addr, 0);
@@ -197,35 +204,133 @@ static void UdpRelayRecvThread(
     }
 }
 
-void RunDivertEngine(const Config& cfg) {
-    g_running = true;
-    std::string proxy_ip = cfg.proxy_host;
-    std::string proto_filter;
+static void TcpProxyWorker(SOCKET client_sock, sockaddr_in client_addr, Config cfg) {
+    NatKey key{ static_cast<uint32_t>(ntohl(client_addr.sin_addr.s_addr)), ntohs(client_addr.sin_port) };
+    NatEntry entry;
 
-    if (cfg.intercept_udp && cfg.intercept_tcp) {
-        proto_filter = "(udp or tcp)";
-    } else if (cfg.intercept_udp) {
-        proto_filter = "udp";
-    } else if (cfg.intercept_tcp) {
-        proto_filter = "tcp";
-    } else {
-        std::cerr << "[divert] Error: No transport protocols enabled for interception\n";
+    if (!g_tcp_nat.Lookup(key, entry)) {
+        std::cerr << "[divert] Connection rejected: No NAT entry for "
+                  << FmtIP(client_addr.sin_addr.s_addr) << ":" << ntohs(client_addr.sin_port) << "\n";
+        closesocket(client_sock);
         return;
     }
 
-    std::string filter = "outbound and !loopback and " + proto_filter;
+    std::cout << "[divert] Routing TCP stream through proxy for "
+              << FmtIP(entry.orig_dst_ip) << ":" << ntohs(entry.orig_dst_port) << "\n";
 
-    if (proxy_ip != "127.0.0.1" && proxy_ip != "localhost") {
-        std::string port_exclude;
-        if (cfg.intercept_udp && cfg.intercept_tcp) {
-            port_exclude = "(tcp? tcp.DstPort != " + std::to_string(cfg.proxy_port) +
-                           " : (udp? udp.DstPort != " + std::to_string(cfg.proxy_port) + " : true))";
-        } else if (cfg.intercept_udp) {
-            port_exclude = "udp.DstPort != " + std::to_string(cfg.proxy_port);
-        } else if (cfg.intercept_tcp) {
-            port_exclude = "tcp.DstPort != " + std::to_string(cfg.proxy_port);
+    SOCKET remote_sock = Socks5TcpConnect(cfg.proxy_host, cfg.proxy_port, entry.orig_dst_ip, entry.orig_dst_port);
+    if (remote_sock == INVALID_SOCKET) {
+        std::cerr << "[divert] Failed to establish SOCKS5 TCP tunnel\n";
+        closesocket(client_sock);
+        return;
+    }
+
+    auto pump = [](SOCKET s1, SOCKET s2) {
+        char buf[16384];
+        DWORD timeout_ms = 1000;
+        setsockopt(s1, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+
+        while (g_running) {
+            int n = recv(s1, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                    continue;
+                }
+                break;
+            }
+            int sent = 0;
+            while (sent < n) {
+                int r = send(s2, buf + sent, n - sent, 0);
+                if (r <= 0) {
+                    goto end;
+                }
+                sent += r;
+            }
         }
-        filter += " and (ip.DstAddr != " + proxy_ip + " or " + port_exclude + ")";
+    end:
+        shutdown(s1, SD_BOTH);
+        shutdown(s2, SD_BOTH);
+    };
+
+    std::thread t1(pump, client_sock, remote_sock);
+    std::thread t2(pump, remote_sock, client_sock);
+
+    t1.join();
+    t2.join();
+
+    closesocket(client_sock);
+    closesocket(remote_sock);
+}
+
+static void TcpProxyAcceptThread(SOCKET listen_sock, Config cfg) {
+    while (g_running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(listen_sock, &readfds);
+
+        timeval tv{ 1, 0 };
+        int ret = select(0, &readfds, nullptr, nullptr, &tv);
+
+        if (ret > 0 && FD_ISSET(listen_sock, &readfds)) {
+            sockaddr_in client_addr{};
+            int addrlen = sizeof(client_addr);
+            SOCKET client_sock = accept(listen_sock, (sockaddr*)&client_addr, &addrlen);
+            if (client_sock != INVALID_SOCKET) {
+                std::cout << "[divert] Local TCP Proxy accepted connection from virtual port " << ntohs(client_addr.sin_port) << "\n";
+                std::thread(TcpProxyWorker, client_sock, client_addr, cfg).detach();
+            }
+        }
+    }
+    closesocket(listen_sock);
+}
+
+void RunDivertEngine(const Config& cfg) {
+    g_running = true;
+    uint16_t local_tcp_port = 0;
+    SOCKET tcp_listener = INVALID_SOCKET;
+
+    if (cfg.intercept_tcp) {
+        tcp_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (tcp_listener != INVALID_SOCKET) {
+            sockaddr_in bind_addr{};
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            bind_addr.sin_port = 0;
+
+            bind(tcp_listener, (sockaddr*)&bind_addr, sizeof(bind_addr));
+            listen(tcp_listener, SOMAXCONN);
+
+            int len = sizeof(bind_addr);
+            getsockname(tcp_listener, (sockaddr*)&bind_addr, &len);
+            local_tcp_port = ntohs(bind_addr.sin_port);
+
+            std::thread(TcpProxyAcceptThread, tcp_listener, cfg).detach();
+            std::cout << "[divert] Started local TCP proxy listener on port " << local_tcp_port << "\n";
+        }
+    }
+
+    if (cfg.intercept_tcp) {
+        std::cout << "[divert] Resolving bypass endpoints...\n";
+        ResolveDenuvoIPs();
+        ResolveEmbarkIPs();
+    }
+
+    std::string exclude_proxy = "";
+    if (cfg.proxy_host != "127.0.0.1" && cfg.proxy_host != "localhost") {
+        exclude_proxy = " and ip.DstAddr != " + cfg.proxy_host;
+    }
+
+    std::string filter = "outbound and ";
+    if (cfg.intercept_tcp && cfg.intercept_udp) {
+        filter += "( ( !loopback and (tcp or udp) " + exclude_proxy + " ) or ( tcp.SrcPort == " + std::to_string(local_tcp_port) + " ) )";
+    } else if (cfg.intercept_tcp) {
+        filter += "( ( !loopback and tcp " + exclude_proxy + " ) or ( tcp.SrcPort == " + std::to_string(local_tcp_port) + " ) )";
+    } else if (cfg.intercept_udp) {
+        filter += "( !loopback and udp " + exclude_proxy + " )";
+    } else {
+        std::cerr << "[divert] Error: No transport protocols enabled for interception\n";
+        return;
     }
 
     std::cout << "[divert] Interception Filter: " << filter << "\n";
@@ -235,34 +340,36 @@ void RunDivertEngine(const Config& cfg) {
     if (handle == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         std::cerr << "[divert] WinDivertOpen() failed with error: " << err << "\n";
-        if (err == ERROR_ACCESS_DENIED)
+        if (err == ERROR_ACCESS_DENIED) {
             std::cerr << "[divert] Administrator privileges required!\n";
+        }
         return;
     }
 
     g_divert_handle = handle;
     std::cout << "[divert] Packet redirection loop started\n";
 
-    /* Active UDP session clean-up worker to prevent system resource leakage */
     std::thread expire_thread([&cfg]() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
-            if (!g_running) break;
+            if (!g_running) {
+                break;
+            }
 
             auto now = std::chrono::steady_clock::now();
             std::vector<UdpProxySession*> to_delete;
 
             {
                 std::lock_guard<std::mutex> lock(g_udp_mutex);
-                for (auto it = g_udp_sessions.begin(); it != g_udp_sessions.end(); ) {
-                    auto* sess = it->second;
+                for (auto i = g_udp_sessions.begin(); i != g_udp_sessions.end(); ) {
+                    auto* sess = i->second;
                     auto idle_sec = std::chrono::duration_cast<std::chrono::seconds>(now - sess->last_active).count();
 
                     if (idle_sec > cfg.udp_session_timeout_sec) {
                         to_delete.push_back(sess);
-                        it = g_udp_sessions.erase(it);
+                        i = g_udp_sessions.erase(i);
                     } else {
-                        ++it;
+                        ++i;
                     }
                 }
             }
@@ -276,6 +383,10 @@ void RunDivertEngine(const Config& cfg) {
                 }
                 delete sess;
             }
+
+            if (cfg.intercept_tcp) {
+                g_tcp_nat.Expire(cfg.udp_session_timeout_sec * 30);
+            }
         }
     });
 
@@ -286,8 +397,9 @@ void RunDivertEngine(const Config& cfg) {
 
     while (g_running) {
         if (!WinDivertRecv(handle, packet.data(), (UINT)packet.size(), &recv_len, &addr)) {
-            if (g_running)
+            if (g_running) {
                 std::cerr << "[divert] WinDivertRecv failed with error: " << GetLastError() << "\n";
+            }
             break;
         }
 
@@ -310,9 +422,29 @@ void RunDivertEngine(const Config& cfg) {
         uint16_t src_port = udph ? udph->SrcPort : (tcph ? tcph->SrcPort : 0);
         uint16_t dst_port = udph ? udph->DstPort : (tcph ? tcph->DstPort : 0);
 
-        /* CRITICAL: Query cache map first to skip costly PID queries on every single active packet stream */
+        if (tcph && cfg.intercept_tcp && ntohs(src_port) == local_tcp_port) {
+            NatKey key{ static_cast<uint32_t>(ntohl(dst_ip)), ntohs(dst_port) };
+            NatEntry entry;
+            if (g_tcp_nat.Lookup(key, entry)) {
+                uint32_t tmp_dst = iph->DstAddr;
+                tcph->SrcPort = entry.orig_dst_port;
+                iph->DstAddr = iph->SrcAddr;
+                iph->SrcAddr = tmp_dst;
+
+                addr.Outbound = FALSE;
+                addr.Loopback = FALSE;
+                addr.Network.IfIdx = entry.if_idx;
+                addr.Network.SubIfIdx = entry.sub_if_idx;
+
+                WinDivertHelperCalcChecksums(packet.data(), recv_len, &addr, 0);
+                WinDivertSend(handle, packet.data(), recv_len, nullptr, &addr);
+                continue;
+            }
+        }
+
         bool should_proxy = false;
         UdpProxySession* sess = nullptr;
+        NatEntry tcp_entry;
 
         if (udph) {
             UdpSessionKey key{ src_ip, src_port };
@@ -323,20 +455,51 @@ void RunDivertEngine(const Config& cfg) {
                 sess->last_active = std::chrono::steady_clock::now();
                 should_proxy = true;
             }
+        } else if (tcph && cfg.intercept_tcp) {
+            NatKey key{ static_cast<uint32_t>(ntohl(dst_ip)), ntohs(src_port) };
+            if (g_tcp_nat.Lookup(key, tcp_entry)) {
+                should_proxy = true;
+            } else if (IsDenuvoIP(dst_ip)) {
+                should_proxy = true;
+                tcp_entry.orig_dst_ip = dst_ip;
+                tcp_entry.orig_dst_port = dst_port;
+                tcp_entry.if_idx = addr.Network.IfIdx;
+                tcp_entry.sub_if_idx = addr.Network.SubIfIdx;
+                g_tcp_nat.Insert(key, tcp_entry);
+                std::cout << "[divert] Intercepted Denuvo connection to " << FmtIP(dst_ip) << ":" << ntohs(dst_port) << "\n";
+            } else if (IsEmbarkIP(dst_ip)) {
+                should_proxy = true;
+                tcp_entry.orig_dst_ip = dst_ip;
+                tcp_entry.orig_dst_port = dst_port;
+                tcp_entry.if_idx = addr.Network.IfIdx;
+                tcp_entry.sub_if_idx = addr.Network.SubIfIdx;
+                g_tcp_nat.Insert(key, tcp_entry);
+                std::cout << "[divert] Intercepted Embark connection to " << FmtIP(dst_ip) << ":" << ntohs(dst_port) << "\n";
+            }
         }
 
         std::string proc_name;
         if (!should_proxy) {
             uint32_t pid = 0;
-            if (udph)
+            if (udph) {
                 pid = GetPidByUdpEndpoint(src_ip, src_port);
-            else if (tcph)
+            } else if (tcph && cfg.intercept_tcp && tcph->Syn && !tcph->Ack) {
                 pid = GetPidByTcpEndpoint(src_ip, src_port, dst_ip, dst_port);
+            }
 
-            if (pid > 0)
+            if (pid > 0) {
                 proc_name = GetProcessName(pid);
+                should_proxy = !proc_name.empty() && IsBlacklisted(proc_name, cfg);
 
-            should_proxy = !proc_name.empty() && IsBlacklisted(proc_name, cfg);
+                if (should_proxy && tcph) {
+                    NatKey key{ static_cast<uint32_t>(ntohl(dst_ip)), ntohs(src_port) };
+                    tcp_entry.orig_dst_ip = dst_ip;
+                    tcp_entry.orig_dst_port = dst_port;
+                    tcp_entry.if_idx = addr.Network.IfIdx;
+                    tcp_entry.sub_if_idx = addr.Network.SubIfIdx;
+                    g_tcp_nat.Insert(key, tcp_entry);
+                }
+            }
         }
 
         if (!should_proxy) {
@@ -345,8 +508,9 @@ void RunDivertEngine(const Config& cfg) {
         }
 
         if (!proc_name.empty()) {
-            std::cout << "[divert] [" << proc_name << " PID=" << GetPidByUdpEndpoint(src_ip, src_port) << "] "
-                      << FmtIP(src_ip) << ":" << ntohs(src_port)
+            std::cout << "[divert] [" << proc_name << " PID="
+                      << (udph ? GetPidByUdpEndpoint(src_ip, src_port) : GetPidByTcpEndpoint(src_ip, src_port, dst_ip, dst_port))
+                      << "] " << FmtIP(src_ip) << ":" << ntohs(src_port)
                       << " -> " << FmtIP(dst_ip) << ":" << ntohs(dst_port)
                       << (udph ? " UDP" : " TCP") << "\n";
         }
@@ -380,7 +544,7 @@ void RunDivertEngine(const Config& cfg) {
                         sess = ns;
                         std::cout << "[divert] Started background UDP tunnel worker\n";
                     } else {
-                        std::cerr << "[divert] SOCKS5 UDP Associate handshakes failed - packet dropped\n";
+                        std::cerr << "[divert] SOCKS5 UDP Associate handshake failed - packet dropped\n";
                         delete ns;
                         WinDivertSend(handle, packet.data(), recv_len, nullptr, &addr);
                         continue;
@@ -388,17 +552,22 @@ void RunDivertEngine(const Config& cfg) {
                 }
             }
 
-            if (!Socks5UdpSend(sess->socks, dst_ip, dst_port, payload, payload_len))
+            if (!Socks5UdpSend(sess->socks, dst_ip, dst_port, payload, payload_len)) {
                 std::cerr << "[divert] SOCKS5 UDP payload delivery failed\n";
+            }
             continue;
         }
 
-        if (tcph) {
-            bool is_syn = (tcph->Syn && !tcph->Ack);
-            if (!is_syn) {
-                WinDivertSend(handle, packet.data(), recv_len, nullptr, &addr);
-                continue;
-            }
+        if (tcph && cfg.intercept_tcp) {
+            uint32_t tmp_dst = iph->DstAddr;
+            tcph->DstPort = htons(local_tcp_port);
+            iph->DstAddr = iph->SrcAddr;
+            iph->SrcAddr = tmp_dst;
+
+            addr.Outbound = FALSE;
+            addr.Loopback = FALSE;
+
+            WinDivertHelperCalcChecksums(packet.data(), recv_len, &addr, 0);
             WinDivertSend(handle, packet.data(), recv_len, nullptr, &addr);
             continue;
         }

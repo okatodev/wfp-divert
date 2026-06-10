@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(WINDIVERT_DIR "${CMAKE_SOURCE_DIR}/windivert")
 
-# Auto-detect target architecture
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(WINDIVERT_ARCH "x64")
     set(WINDIVERT_SYS "WinDivert64.sys")
@@ -22,11 +21,15 @@ add_executable(wfp_divert
         src/socks5_udp.cpp
         src/socks5_tcp.cpp
         src/divert.cpp
+        src/nat_table.cpp
+        Extra/denuvo/denuvo_bypass.cpp
+        Extra/embark/embark_bypass.cpp
 )
 
 target_include_directories(wfp_divert PRIVATE
         include
         ${WINDIVERT_DIR}
+        Extra
 )
 
 target_link_libraries(wfp_divert PRIVATE
@@ -37,7 +40,6 @@ target_link_libraries(wfp_divert PRIVATE
         shell32
 )
 
-# Robust post-build file copy operations including config.example.json
 add_custom_command(TARGET wfp_divert POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${WINDIVERT_DIR}/${WINDIVERT_ARCH}/WinDivert.dll"
