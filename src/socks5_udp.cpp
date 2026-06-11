@@ -63,20 +63,42 @@ bool Socks5UdpAssociate(
         closesocket(ctrl); return false;
     }
 
-    uint8_t resp[10];
-    if (!RecvAll(ctrl, resp, 10) || resp[0] != 0x05 || resp[1] != 0x00) {
-        std::cerr << "[socks5_udp] UDP ASSOCIATE rejected with code: " << (int)resp[1] << "\n";
-        closesocket(ctrl); return false;
-    }
-    if (resp[3] != 0x01) {
-        std::cerr << "[socks5_udp] Non-IPv4 binding addresses are not supported\n";
+    uint8_t resp_header[4];
+    if (!RecvAll(ctrl, resp_header, 4) || resp_header[0] != 0x05 || resp_header[1] != 0x00) {
+        std::cerr << "[socks5_udp] UDP ASSOCIATE rejected with code: " << (int)resp_header[1] << "\n";
         closesocket(ctrl); return false;
     }
 
-    uint32_t relay_ip;
-    uint16_t relay_port;
-    memcpy(&relay_ip,   resp + 4, 4);
-    memcpy(&relay_port, resp + 8, 2);
+    uint32_t relay_ip = 0;
+    uint16_t relay_port = 0;
+
+    if (resp_header[3] == 0x01) {
+        uint8_t addr_port[6];
+        if (!RecvAll(ctrl, addr_port, 6)) {
+            closesocket(ctrl); return false;
+        }
+        memcpy(&relay_ip, addr_port, 4);
+        memcpy(&relay_port, addr_port + 4, 2);
+    } else if (resp_header[3] == 0x03) {
+        uint8_t len_byte;
+        if (!RecvAll(ctrl, &len_byte, 1)) {
+            closesocket(ctrl); return false;
+        }
+        std::vector<uint8_t> domain_port(len_byte + 2);
+        if (!RecvAll(ctrl, domain_port.data(), len_byte + 2)) {
+            closesocket(ctrl); return false;
+        }
+        memcpy(&relay_port, domain_port.data() + len_byte, 2);
+    } else if (resp_header[3] == 0x04) {
+        uint8_t addr_port[18];
+        if (!RecvAll(ctrl, addr_port, 18)) {
+            closesocket(ctrl); return false;
+        }
+        memcpy(&relay_port, addr_port + 16, 2);
+    } else {
+        std::cerr << "[socks5_udp] Non-IPv4 binding addresses are not supported\n";
+        closesocket(ctrl); return false;
+    }
 
     if (relay_ip == 0)
         relay_ip = proxy_addr.sin_addr.s_addr;

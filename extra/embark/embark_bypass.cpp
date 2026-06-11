@@ -14,11 +14,10 @@ void ResolveEmbarkIPs() {
     const std::vector<std::string> domains = {
         "embark.games",
         "id.embark.games",
-        "api.embark.games",
-        "api.embark-studios.com",
         "embark-studios.com",
-        "embark.services",
-        "discovery.embark.games"
+        "es-pio.net",
+        "api-gateway.europe.es-pio.net",
+        "client2pubsub.europe.es-pio.net"
     };
 
     for (const auto& domain : domains) {

@@ -3,6 +3,7 @@
 #include <ws2tcpip.h>
 #include <iostream>
 #include <cstring>
+#include <vector>
 
 static bool SendAll(SOCKET s, const uint8_t* buf, int len) {
     int sent = 0;
@@ -48,7 +49,7 @@ SOCKET Socks5TcpConnect(
     if (!SendAll(s, hs, 3)) { closesocket(s); return INVALID_SOCKET; }
 
     uint8_t hs_resp[2];
-    if (!RecvAll(s, hs_resp, 2) || hs_resp[1] != 0x00) {
+    if (!RecvAll(s, hs_resp, 2) || hs_resp[0] != 0x05 || hs_resp[1] != 0x00) {
         std::cerr << "[socks5_tcp] Authentication method rejected\n";
         closesocket(s); return INVALID_SOCKET;
     }
@@ -59,10 +60,42 @@ SOCKET Socks5TcpConnect(
 
     if (!SendAll(s, req, 10)) { closesocket(s); return INVALID_SOCKET; }
 
-    uint8_t resp[10];
-    if (!RecvAll(s, resp, 10) || resp[1] != 0x00) {
-        std::cerr << "[socks5_tcp] CONNECT request rejected with code: " << (int)resp[1] << "\n";
-        closesocket(s); return INVALID_SOCKET;
+    uint8_t resp_header[4];
+    if (!RecvAll(s, resp_header, 4)) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    if (resp_header[0] != 0x05 || resp_header[1] != 0x00) {
+        std::cerr << "[socks5_tcp] CONNECT request rejected with code: " << (int)resp_header[1] << "\n";
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    int remaining = 0;
+    if (resp_header[3] == 0x01) {
+        remaining = 6;
+    } else if (resp_header[3] == 0x03) {
+        uint8_t len_byte;
+        if (!RecvAll(s, &len_byte, 1)) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+        remaining = len_byte + 2;
+    } else if (resp_header[3] == 0x04) {
+        remaining = 18;
+    } else {
+        std::cerr << "[socks5_tcp] Unknown address type in response: " << (int)resp_header[3] << "\n";
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    if (remaining > 0) {
+        std::vector<uint8_t> dummy(remaining);
+        if (!RecvAll(s, dummy.data(), remaining)) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
     }
 
     return s;
