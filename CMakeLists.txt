@@ -22,14 +22,11 @@ add_executable(wfp_divert
         src/socks5_tcp.cpp
         src/divert.cpp
         src/nat_table.cpp
-        Extra/denuvo/denuvo_bypass.cpp
-        Extra/embark/embark_bypass.cpp
 )
 
 target_include_directories(wfp_divert PRIVATE
         include
         ${WINDIVERT_DIR}
-        Extra
 )
 
 target_link_libraries(wfp_divert PRIVATE

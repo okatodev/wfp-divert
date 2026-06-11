@@ -4,8 +4,6 @@
 #include "socks5_udp.h"
 #include "socks5_tcp.h"
 #include "nat_table.h"
-#include "../extra/denuvo/denuvo_bypass.h"
-#include "../extra/embark/embark_bypass.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -14,10 +12,12 @@
 #include "windivert.h"
 
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <vector>
 #include <algorithm>
@@ -26,6 +26,8 @@
 static std::atomic<bool> g_running{ true };
 static HANDLE            g_divert_handle = INVALID_HANDLE_VALUE;
 static NatTable          g_tcp_nat;
+static std::unordered_set<uint32_t> g_resolved_ips;
+static std::vector<CidrBlock> g_geoip_blocks;
 
 void StopDivertEngine() {
     g_running = false;
@@ -40,7 +42,7 @@ static std::string ToLower(std::string s) {
 }
 
 static bool IsBlacklisted(const std::string& exe_name, const Config& cfg) {
-    return cfg.blacklist.count(ToLower(exe_name)) > 0;
+    return cfg.apps.count(ToLower(exe_name)) > 0;
 }
 
 static std::string FmtIP(uint32_t ip_net) {
@@ -114,6 +116,74 @@ static void ParsePacket(
         ppTcpHdr, ppUdpHdr,
         ppData, pDataLen,
         &pNext, &nextLen);
+}
+
+static void ResolveConfigHostnames(const std::vector<std::string>& hostnames) {
+    g_resolved_ips.clear();
+    for (const auto& domain : hostnames) {
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(domain.c_str(), nullptr, &hints, &res) == 0) {
+            for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+                sockaddr_in* ipv4 = (sockaddr_in*)p->ai_addr;
+                g_resolved_ips.insert(ipv4->sin_addr.s_addr);
+                std::cout << "[divert] Resolved " << domain << " to " << inet_ntoa(ipv4->sin_addr) << "\n";
+            }
+            freeaddrinfo(res);
+        } else {
+            std::cerr << "[divert] Failed to resolve hostname: " << domain << "\n";
+        }
+    }
+}
+
+static void LoadGeoIpFiles(const std::vector<std::string>& geoip_codes) {
+    g_geoip_blocks.clear();
+    for (const auto& code : geoip_codes) {
+        std::string filename = "geoip_" + code + ".txt";
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "[divert] Warning: GeoIP file not found: " << filename << "\n";
+            continue;
+        }
+        std::string line;
+        int count = 0;
+        while (std::getline(file, line)) {
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            if (line.empty() || line[0] == '#') continue;
+
+            CidrBlock block;
+            if (ParseCidr(line, block)) {
+                g_geoip_blocks.push_back(block);
+                count++;
+            }
+        }
+        std::cout << "[divert] Loaded " << count << " IP ranges from " << filename << "\n";
+    }
+}
+
+static bool MatchCidr(uint32_t ip_host, const std::vector<CidrBlock>& blocks) {
+    for (const auto& b : blocks) {
+        if ((ip_host & b.mask) == (b.base_ip & b.mask)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldProxyByIp(uint32_t dst_ip_net, const Config& cfg) {
+    if (g_resolved_ips.count(dst_ip_net) > 0) {
+        return true;
+    }
+    uint32_t dst_ip_host = ntohl(dst_ip_net);
+    if (MatchCidr(dst_ip_host, cfg.ips)) {
+        return true;
+    }
+    if (MatchCidr(dst_ip_host, g_geoip_blocks)) {
+        return true;
+    }
+    return false;
 }
 
 struct UdpSessionKey {
@@ -311,9 +381,10 @@ void RunDivertEngine(const Config& cfg) {
     }
 
     if (cfg.intercept_tcp) {
-        std::cout << "[divert] Resolving bypass endpoints...\n";
-        ResolveDenuvoIPs();
-        ResolveEmbarkIPs();
+        std::cout << "[divert] Loading GeoIP routing tables...\n";
+        LoadGeoIpFiles(cfg.geoip);
+        std::cout << "[divert] Resolving configured hostnames...\n";
+        ResolveConfigHostnames(cfg.hostnames);
     }
 
     std::string exclude_proxy = "";
@@ -459,22 +530,14 @@ void RunDivertEngine(const Config& cfg) {
             NatKey key{ static_cast<uint32_t>(ntohl(dst_ip)), ntohs(src_port) };
             if (g_tcp_nat.Lookup(key, tcp_entry)) {
                 should_proxy = true;
-            } else if (IsDenuvoIP(dst_ip)) {
+            } else if (ShouldProxyByIp(dst_ip, cfg)) {
                 should_proxy = true;
                 tcp_entry.orig_dst_ip = dst_ip;
                 tcp_entry.orig_dst_port = dst_port;
                 tcp_entry.if_idx = addr.Network.IfIdx;
                 tcp_entry.sub_if_idx = addr.Network.SubIfIdx;
                 g_tcp_nat.Insert(key, tcp_entry);
-                std::cout << "[divert] Intercepted Denuvo connection to " << FmtIP(dst_ip) << ":" << ntohs(dst_port) << "\n";
-            } else if (IsEmbarkIP(dst_ip)) {
-                should_proxy = true;
-                tcp_entry.orig_dst_ip = dst_ip;
-                tcp_entry.orig_dst_port = dst_port;
-                tcp_entry.if_idx = addr.Network.IfIdx;
-                tcp_entry.sub_if_idx = addr.Network.SubIfIdx;
-                g_tcp_nat.Insert(key, tcp_entry);
-                std::cout << "[divert] Intercepted Embark connection to " << FmtIP(dst_ip) << ":" << ntohs(dst_port) << "\n";
+                std::cout << "[divert] Intercepted connection to bypassed IP: " << FmtIP(dst_ip) << ":" << ntohs(dst_port) << "\n";
             }
         }
 

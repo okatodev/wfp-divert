@@ -3,7 +3,7 @@
 
 [Читать на русском (README_RU.md) ->](README_RU.md)
 
-A lightweight, high-performance background utility written in C++17 designed to selectively redirect TCP and UDP traffic of specific Windows applications, as well as game authorization servers, through a local SOCKS5 proxy.
+A lightweight, high-performance background utility written in C++17 designed to selectively redirect TCP and UDP traffic of specific Windows applications, hostnames, IP ranges, and GeoIP regions through a local SOCKS5 proxy.
 
 The project is developed to resolve latency and blocking issues with voice communication in Discord (WebRTC/RTC voice calls), Telegram, and in general for any similar use cases.
 
@@ -13,9 +13,9 @@ The project is developed to resolve latency and blocking issues with voice commu
 
 - **True Transparency (No System Proxy):** The utility operates at the kernel network packet level. It is no longer required to enable the Windows system proxy in VPN clients—the program intercepts both TCP and UDP on-the-fly.
 - **Double NAT (Address Reflection):** An innovative method for TCP traffic redirection. The program swaps the source and destination IP addresses, converting an outbound connection into an inbound one on a local port. This bypasses strict Windows security policies (Strong Host Model) and prevents firewall blocks without using complex loopback interfaces.
-- **Bypassing Protected PPL Processes (Anti-Cheats):** Resolving process IDs and names using `CreateToolhelp32Snapshot` instead of `OpenProcess`. This allows the utility to inspect and redirect traffic of protected anti-cheat drivers (Denuvo, Easy Anti-Cheat) to which access is closed even for the Administrator account.
-- **Modular Architecture (`Extra` Folder):** The logic for dynamic interception of blocked servers (Denuvo and Embark ID) is completely isolated into separate modules. This leaves the core of the interceptor clean and easily expandable.
-- **Selective IP-Based Bypass:** For games like *The Finals*, the utility automatically resolves authorization server addresses at startup. Only traffic bound for these specific IPs is proxied. The game itself runs directly with minimal ping.
+- **Bypassing Protected PPL Processes:** Resolving process IDs and names using `CreateToolhelp32Snapshot` instead of `OpenProcess`. This allows the utility to inspect and redirect traffic of protected processes (such as anti-cheat drivers or system services) to which access is closed even for the Administrator account.
+- **Flexible Configuration-Driven Routing:** Supports four independent types of traffic redirection: by executable names (`apps`), by resolved domain names (`hostnames`), by specific IP ranges (`ips` using CIDR subnets), and by geographic regions (`geoip` using CIDR block files).
+- **Dynamic Hostname Resolution:** Automatically resolves configured domains to their active IP addresses at startup. Intercepts and proxies only TCP traffic bound for these specific IPs, allowing other traffic to bypass the SOCKS5 tunnel natively.
 - **Active Resource Management:** A background thread periodically cleans up inactive UDP sessions, closing sockets and terminating their threads after a timeout (protection against RAM and system handle leaks).
 
 ---
@@ -23,7 +23,7 @@ The project is developed to resolve latency and blocking issues with voice commu
 ## How It Works Under the Hood
 
 ```text
- [Program (Discord / The Finals)] 
+ [Program (Discord etc)] 
        │
        ├──► TCP (Authorization/API) ──► WinDivert Driver (Double NAT) ──► SOCKS5 (v2rayN) ──► VPN/VPS
        │
@@ -80,11 +80,19 @@ An example file is provided with the build under the name `config.example.json`:
   "intercept_tcp": true,
   "intercept_udp": true,
   "udp_session_timeout_sec": 60,
-  "blacklist": [
+  "apps": [
     "discord.exe",
     "telegram.exe",
-    "update.exe",
-    "denuvo-anti-cheat-update-service.exe"
+    "update.exe"
+  ],
+  "hostnames": [
+    "example.com"
+  ],
+  "ips": [
+    "1.1.1.1/32"
+  ],
+  "geoip": [
+    "ru"
   ]
 }
 ```
@@ -93,10 +101,13 @@ An example file is provided with the build under the name `config.example.json`:
 
 * **`proxy_host`** (string): The IP address of your local VPN client (usually `127.0.0.1` for v2rayN/Nekoray).
 * **`proxy_port`** (number): The SOCKS5/Mixed port of your client. Typically `10808` for v2rayN or `2080` for Nekoray.
-* **`intercept_tcp`** (boolean): Recommended to be set to `true`. Enables kernel-level interception of TCP connections for blacklisted applications by the driver.
+* **`intercept_tcp`** (boolean): Recommended to be set to `true`. Enables kernel-level interception of TCP connections by the driver.
 * **`intercept_udp`** (boolean): Recommended to be set to `true`. Enables interception of UDP voice calls to redirect them to the proxy tunnel.
 * **`udp_session_timeout_sec`** (number): Idle time in seconds, after which an inactive UDP session is closed, freeing memory.
-* **`blacklist`** (array of strings): Process names for selective proxying in **lowercase** and strictly with the `.exe` extension.
+* **`apps`** (array of strings): Process names for selective proxying in **lowercase** and strictly with the `.exe` extension.
+* **`hostnames`** (array of strings): Hostnames to resolve at startup and selectively redirect.
+* **`ips`** (array of strings): Specific IP addresses or CIDR subnets to selectively redirect.
+* **`geoip`** (array of strings): Lowercase country codes to load corresponding subnets (e.g., `"geoip_ru.txt"`) and selectively redirect.
 
 ---
 

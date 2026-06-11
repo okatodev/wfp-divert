@@ -152,7 +152,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[main] Loading configuration file: " << g_config_path << "\n";
     g_cfg = LoadConfig(g_config_path);
 
-    if (g_cfg.blacklist.empty()) {
+    if (g_cfg.apps.empty()) {
         std::cout << "[main] WARNING: Blacklist is empty. All packet traffic will route directly.\n";
     }
 
